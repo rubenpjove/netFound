@@ -131,9 +131,14 @@ def _install_binaries(binaries_dir: str, root: Path) -> None:
             )
         shutil.copy2(str(src), str(dst))
         dst.chmod(0o755)
-    # Also restore execute permission on the .sh wrapper scripts (stripped by tar extraction).
+    # Also restore execute permission on the .sh wrapper scripts (stripped by tar extraction)
+    # and fix CRLF line endings (git on Windows converts LF→CRLF, breaking the shebang).
     for sh_file in dst_dir.glob("*.sh"):
         sh_file.chmod(0o755)
+        content = sh_file.read_bytes()
+        if b"\r\n" in content:
+            sh_file.write_bytes(content.replace(b"\r\n", b"\n"))
+            logger.info("Fixed CRLF line endings in %s", sh_file.name)
     logger.info("Installed binaries from %s into %s", binaries_dir, dst_dir)
 
 
