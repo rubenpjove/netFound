@@ -22,4 +22,4 @@ if [ ! -f "$filter_script" ]; then
     exit 1
 fi
 
-find "$input_folder" -type f | parallel "$filter_script {} $output_folder/{/}"
+find -L "$input_folder" -type f | parallel "$filter_script {} $output_folder/{/}"
