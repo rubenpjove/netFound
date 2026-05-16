@@ -131,6 +131,9 @@ def _install_binaries(binaries_dir: str, root: Path) -> None:
             )
         shutil.copy2(str(src), str(dst))
         dst.chmod(0o755)
+    # Also restore execute permission on the .sh wrapper scripts (stripped by tar extraction).
+    for sh_file in dst_dir.glob("*.sh"):
+        sh_file.chmod(0o755)
     logger.info("Installed binaries from %s into %s", binaries_dir, dst_dir)
 
 
