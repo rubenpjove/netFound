@@ -85,6 +85,10 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                    help="Do not delete the work directory after successful preprocessing.")
     p.add_argument("--tcp_options", action="store_true", default=False,
                    help="Include TCP options in tokenization (requires tcp_options-aware config).")
+    p.add_argument("--binaries_dir", default=None,
+                   help="Directory containing pre-compiled 1_filter and 3_field_extraction binaries. "
+                        "If provided, binaries are copied to pre_process_src/ before preprocessing. "
+                        "Use when running from a fresh code snapshot (e.g. labrunner on CESGA).")
     return p
 
 
@@ -107,6 +111,29 @@ def _get_preprocess_script(root: Path) -> Path:
     return script
 
 
+def _install_binaries(binaries_dir: str, root: Path) -> None:
+    """
+    Copy pre-compiled binaries from *binaries_dir* into ``pre_process_src/``.
+
+    Used when running from a fresh code snapshot (e.g. labrunner on CESGA)
+    where the binaries are stored in a persistent directory outside the snapshot.
+    """
+    src_dir = Path(binaries_dir)
+    dst_dir = root / "pre_process_src"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for binary_name in ("1_filter", "3_field_extraction"):
+        src = src_dir / binary_name
+        dst = dst_dir / binary_name
+        if not src.exists():
+            raise FileNotFoundError(
+                f"Binary '{binary_name}' not found in binaries_dir={binaries_dir}. "
+                "Compile it first — see CLAUDE.md 'netFound one-time setup'."
+            )
+        shutil.copy2(str(src), str(dst))
+        dst.chmod(0o755)
+    logger.info("Installed binaries from %s into %s", binaries_dir, dst_dir)
+
+
 def _validate_binaries(root: Path) -> None:
     """Assert that C++ binaries compiled from packets_processing_src/ exist."""
     pre_src = root / "pre_process_src"
@@ -120,6 +147,8 @@ def _validate_binaries(root: Path) -> None:
             "  cmake --build build\n"
             "  cp build/1_filter           ../\n"
             "  cp build/3_field_extraction ../\n\n"
+            "Or set binaries_dir in config/osfing/ntfm/netfound.yaml pointing to a\n"
+            "persistent directory where the binaries are stored.\n\n"
             f"Missing binaries: {missing}"
         )
 
@@ -209,6 +238,8 @@ def main() -> None:
 
     netfound_root = _get_netfound_root()
     preprocess_script = _get_preprocess_script(netfound_root)
+    if args.binaries_dir:
+        _install_binaries(args.binaries_dir, netfound_root)
     _validate_binaries(netfound_root)
 
     # Load manifests
