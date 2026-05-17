@@ -121,7 +121,7 @@ def _install_binaries(binaries_dir: str, root: Path) -> None:
     src_dir = Path(binaries_dir)
     dst_dir = root / "pre_process_src"
     dst_dir.mkdir(parents=True, exist_ok=True)
-    for binary_name in ("1_filter", "3_field_extraction"):
+    for binary_name in ("1_filter", "3_field_extraction", "PcapSplitter"):
         src = src_dir / binary_name
         dst = dst_dir / binary_name
         if not src.exists():
@@ -145,7 +145,7 @@ def _install_binaries(binaries_dir: str, root: Path) -> None:
 def _validate_binaries(root: Path) -> None:
     """Assert that C++ binaries compiled from packets_processing_src/ exist."""
     pre_src = root / "pre_process_src"
-    required = [pre_src / "1_filter", pre_src / "3_field_extraction"]
+    required = [pre_src / "1_filter", pre_src / "3_field_extraction", pre_src / "PcapSplitter"]
     missing = [str(b) for b in required if not b.exists()]
     if missing:
         raise RuntimeError(
@@ -155,8 +155,10 @@ def _validate_binaries(root: Path) -> None:
             "  cmake --build build\n"
             "  cp build/1_filter           ../\n"
             "  cp build/3_field_extraction ../\n\n"
+            "  # PcapSplitter: build from PcapPlusPlus repo root with -DPCAPPP_BUILD_EXAMPLES=ON\n"
+            "  # then copy examples_bin/PcapSplitter to pre_process_src/\n\n"
             "Or set binaries_dir in config/osfing/ntfm/netfound.yaml pointing to a\n"
-            "persistent directory where the binaries are stored.\n\n"
+            "persistent directory where all three binaries are stored.\n\n"
             f"Missing binaries: {missing}"
         )
 
