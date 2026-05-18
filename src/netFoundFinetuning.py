@@ -4,6 +4,7 @@ from sklearn.exceptions import UndefinedMetricWarning
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+import json
 import random
 import os
 from copy import deepcopy
@@ -41,6 +42,17 @@ class FineTuningDataTrainingArguments(utils.CommonDataTrainingArguments):
     problem_type: Optional[str] = field(
         default=None,
         metadata={"help": "Override regression or classification task"},
+    )
+    label_maps: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to label_maps.json produced by the pipeline preprocessing step. "
+                "When provided, the LabelEncoder is fitted on the full sorted label space "
+                "defined there (same as osfing/predict.py), guaranteeing consistent "
+                "label→integer mapping regardless of which classes appear in train vs dev."
+            )
+        },
     )
     p: float = field(
         default=None,
@@ -98,10 +110,31 @@ def main():
     # Data preparation
     train_dataset, test_dataset = utils.load_train_test_datasets(logger, data_args)
 
-    # Fit the LabelEncoder on the union of all splits so that labels absent from
-    # train (but present in dev/test) do not cause "unseen labels" errors.
-    all_splits_for_encoding = concatenate_datasets([train_dataset, test_dataset])
-    label_encoder, le_mapping_function = get_label_encoder(data_args.problem_type, all_splits_for_encoding, batch_size=1024)
+    # Build the LabelEncoder from the canonical label space in label_maps.json when
+    # available (same approach as osfing/predict.py).  This guarantees a consistent
+    # label→integer mapping regardless of which classes happen to appear in train vs
+    # dev, and keeps training and inference encoders in perfect sync.
+    # Fallback: fit on the union of train + dev so we never crash on unseen labels.
+    if data_args.label_maps and os.path.exists(data_args.label_maps):
+        logger.info("Fitting LabelEncoder from label_maps.json: %s", data_args.label_maps)
+        with open(data_args.label_maps, encoding="utf-8") as _fh:
+            _label_maps = json.load(_fh)
+        _all_label_names = sorted(_label_maps["label2id"].keys())
+        label_encoder = LabelEncoder()
+        label_encoder.fit(_all_label_names)
+
+        def le_mapping_function(_batch):
+            _batch["labels"] = label_encoder.transform(_batch["labels"]).tolist()
+            return _batch
+    else:
+        logger.warning(
+            "label_maps not provided or not found; fitting LabelEncoder on train+dev union. "
+            "Pass --label_maps for guaranteed consistency with inference."
+        )
+        _all_splits = concatenate_datasets([train_dataset, test_dataset])
+        label_encoder, le_mapping_function = get_label_encoder(
+            data_args.problem_type, _all_splits, batch_size=1024
+        )
     train_dataset = train_dataset.map(function=le_mapping_function, batched=True)
     test_dataset = test_dataset.map(function=le_mapping_function, batched=True)
 
