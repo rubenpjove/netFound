@@ -209,7 +209,17 @@ def update_config(
 
     if config is None:
         from netFoundConfigs import CONFIG_SIZES
-        config = CONFIG_SIZES[model_args.size]()
+        # Prefer loading architecture from the pretrained model's config.json so
+        # that hidden_size / num_layers / intermediate_size are always consistent
+        # with the actual checkpoint weights.  Fall back to CONFIG_SIZES[size] when
+        # no local config.json is found (e.g. random init or HF hub model id).
+        model_path = getattr(model_args, "model_name_or_path", None)
+        cfg_json = os.path.join(model_path, "config.json") if model_path else None
+        if cfg_json and os.path.isfile(cfg_json):
+            from modules.netFoundConfigBase import netFoundConfig
+            config = netFoundConfig.from_pretrained(model_path)
+        else:
+            config = CONFIG_SIZES[model_args.size]()
 
     _IGNORE_KEYS = {"accelerator_config"}
 
