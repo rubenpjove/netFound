@@ -17,6 +17,7 @@ from sklearn.preprocessing import LabelEncoder
 from tqdm.auto import tqdm
 
 from torch.distributed.elastic.multiprocessing.errors import record
+from datasets import concatenate_datasets
 from datasets.distributed import split_dataset_by_node
 from transformers import HfArgumentParser, TrainingArguments
 
@@ -97,7 +98,10 @@ def main():
     # Data preparation
     train_dataset, test_dataset = utils.load_train_test_datasets(logger, data_args)
 
-    label_encoder, le_mapping_function = get_label_encoder(data_args.problem_type, train_dataset, batch_size=1024)
+    # Fit the LabelEncoder on the union of all splits so that labels absent from
+    # train (but present in dev/test) do not cause "unseen labels" errors.
+    all_splits_for_encoding = concatenate_datasets([train_dataset, test_dataset])
+    label_encoder, le_mapping_function = get_label_encoder(data_args.problem_type, all_splits_for_encoding, batch_size=1024)
     train_dataset = train_dataset.map(function=le_mapping_function, batched=True)
     test_dataset = test_dataset.map(function=le_mapping_function, batched=True)
 
