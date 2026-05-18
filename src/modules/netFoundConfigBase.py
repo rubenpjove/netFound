@@ -22,6 +22,7 @@ class netFoundConfig(PretrainedConfig):
             self,
             vocab_size=65600,
             hidden_size=768,
+            is_decoder=False,  # required by RoFormerSelfAttention in transformers ≥5.x
             max_bursts=12,
             max_burst_length=108 + 1,
             model_max_length=1296 + 12,
