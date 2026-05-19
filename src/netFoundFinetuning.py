@@ -175,7 +175,9 @@ def main():
             model_args.model_name_or_path
     ):
         logger.warning(f"Using weights from {model_args.model_name_or_path}")
-        model = netFoundFinetuningModel.from_pretrained(model_args.model_name_or_path, config=config)
+        model = netFoundFinetuningModel.from_pretrained(
+            model_args.model_name_or_path, config=config, ignore_mismatched_sizes=True
+        )
     else:
         model = netFoundFinetuningModel(config=config)
     model = utils.possibly_freeze(model, model_args)
