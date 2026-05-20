@@ -63,7 +63,7 @@ class netFoundRobertaEmbeddings(RobertaEmbeddings, netFoundEmbeddingsWithMeta):
     ):
         position_ids = self.create_position_ids_from_input_ids(input_ids, self.padding_idx, self.position_ids)
         embeddings = self.word_embeddings(input_ids)
-        if self.position_embedding_type == "absolute":
+        if getattr(self, "position_embedding_type", "absolute") == "absolute":
             position_embeddings = self.position_embeddings(position_ids)
             embeddings += position_embeddings
         embeddings = self.addMetaEmbeddings(embeddings, direction, iats, bytes, pkt_count, protocol)
