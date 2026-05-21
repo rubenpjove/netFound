@@ -99,9 +99,10 @@ class netFoundBaseModel(netFoundPretrainedModel):
             input_ids, position_ids, direction, iats, bytes, pkt_count, protocol
         )
         input_shape = input_ids.size()
-        device = input_ids.device
+        # transformers 5.x: get_extended_attention_mask signature is
+        # (attention_mask, input_shape, dtype=None) — third positional arg is dtype, not device.
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
-            attention_mask, input_shape, device
+            attention_mask, input_shape, dtype=self.dtype
         )
         num_bursts = input_ids.shape[-1] // batch_max_burst_length
         encoder_outputs = self.encoder(
