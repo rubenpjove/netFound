@@ -152,6 +152,14 @@ def main() -> None:  # noqa: C901 — complexity acceptable for a standalone scr
     config.p = 0  # disable augmentation
 
     model = netFoundFinetuningModel.from_pretrained(args.model_dir, config=config)
+    # Re-initialize position_ids buffer (defensive — same fix as netFoundFinetuning.py).
+    # If the saved checkpoint accidentally persisted position_ids with Roberta-style offsets,
+    # this guarantees correct [0..max_position_embeddings-1] values to avoid CUDA OOB.
+    model.base_transformer.embeddings.register_buffer(
+        "position_ids",
+        torch.arange(config.max_position_embeddings).expand((1, -1)),
+        persistent=False,
+    )
     model.eval()
 
     # ── 3. Dataset ─────────────────────────────────────────────────────────────
@@ -164,8 +172,11 @@ def main() -> None:  # noqa: C901 — complexity acceptable for a standalone scr
     else:
         dataset = raw_dataset
 
-    # total_bursts column is required by load_train_test_datasets / tokenizer.
-    dataset = dataset.add_column("total_bursts", [0] * len(dataset))
+    # total_bursts column is required by the tokenizer/collator; the tokenizer will
+    # overwrite it with real per-flow burst counts during the map() below. Only add
+    # the placeholder if the raw Arrow dataset does not already have this column.
+    if "total_bursts" not in dataset.column_names:
+        dataset = dataset.add_column("total_bursts", [0] * len(dataset))
 
     # Encode string labels → LabelEncoder int (same mapping as during training).
     def _encode_labels(batch: dict) -> dict:
@@ -199,7 +210,7 @@ def main() -> None:  # noqa: C901 — complexity acceptable for a standalone scr
         model=model,
         args=training_args,
         data_collator=data_collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
 
     logger.info("Running inference on %d samples…", len(dataset))
