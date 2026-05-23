@@ -142,7 +142,7 @@ def main() -> None:  # noqa: C901 — complexity acceptable for a standalone scr
         output_dir=output_dir,
         per_device_eval_batch_size=args.batch_size,
         dataloader_num_workers=args.num_workers,
-        no_cuda=args.no_cuda,
+        use_cpu=args.no_cuda,       # transformers 5.x renamed no_cuda → use_cpu
         do_train=False,
         do_eval=False,
         report_to="none",          # disable MLflow / WandB during inference
