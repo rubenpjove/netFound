@@ -60,8 +60,11 @@ class netFoundRobertaEmbeddings(RobertaEmbeddings, netFoundEmbeddingsWithMeta):
             bytes=None,
             pkt_count=None,
             protocol=None,
+            batch_max_burst_length=None,
     ):
-        position_ids = self.create_position_ids_from_input_ids(input_ids, self.padding_idx, self.position_ids)
+        position_ids = self.create_position_ids_from_input_ids(
+            input_ids, self.padding_idx, batch_max_burst_length, self.position_ids
+        )
         embeddings = self.word_embeddings(input_ids)
         if getattr(self, "position_embedding_type", "absolute") == "absolute":
             position_embeddings = self.position_embeddings(position_ids)
@@ -72,15 +75,31 @@ class netFoundRobertaEmbeddings(RobertaEmbeddings, netFoundEmbeddingsWithMeta):
         return embeddings
 
     @staticmethod
-    def create_position_ids_from_input_ids(input_ids, padding_idx, position_ids):
+    def create_position_ids_from_input_ids(input_ids, padding_idx, burst_length=None, position_ids=None):
+        """Per-burst absolute position ids for the flattened token sequence.
+
+        ``input_ids`` is padded to ``num_bursts * burst_length`` where
+        ``burst_length`` is the *dynamic* per-batch max burst length (CLS + tokens),
+        not the static ``max_position_embeddings``. Each burst gets positions
+        ``[0, 1, ..., burst_length-1]``; padding positions are zeroed. Values stay in
+        ``[0, burst_length-1] ⊆ [0, max_position_embeddings-1]`` so the lookup is safe.
+
+        Falls back to the legacy fixed-buffer repeat when ``burst_length`` is None.
+        """
         mask = input_ids.ne(padding_idx).int()
-        position_ids = (
+        if burst_length is None:
+            # Legacy path (kept for callers that don't pass burst_length).
+            return (
                 position_ids.repeat(
                     input_ids.shape[0], input_ids.shape[1] // position_ids.shape[1]
                 )
                 * mask
-        )
-        return position_ids
+            )
+        num_bursts = input_ids.shape[1] // burst_length
+        base = torch.arange(
+            burst_length, dtype=torch.long, device=input_ids.device
+        ).repeat(num_bursts)
+        return base.unsqueeze(0).expand(input_ids.shape[0], -1) * mask
 
 
 class netFoundRoformerEmbeddings(RoFormerEmbeddings, netFoundEmbeddingsWithMeta):

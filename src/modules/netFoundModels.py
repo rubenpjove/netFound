@@ -96,7 +96,8 @@ class netFoundBaseModel(netFoundPretrainedModel):
     ):
         batch_max_burst_length = dataset_burst_sizes.max().item() + 1  # +1 for CLS token
         embeddings = self.embeddings(
-            input_ids, position_ids, direction, iats, bytes, pkt_count, protocol
+            input_ids, position_ids, direction, iats, bytes, pkt_count, protocol,
+            batch_max_burst_length=batch_max_burst_length,
         )
         input_shape = input_ids.size()
         # transformers 5.x: get_extended_attention_mask signature is
