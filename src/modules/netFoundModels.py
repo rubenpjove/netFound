@@ -363,7 +363,14 @@ def calculate_finetuning_loss(logits, labels, problem_type, num_labels):
 
 class netFoundFinetuningModel(netFoundPretrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
-    _tied_weights_keys = ["base_transformer.encoder.layer.*.position_embeddings.weight"]
+    # transformers 5.x expects _tied_weights_keys to be a dict ({tied: source}); the
+    # legacy list form crashes save_pretrained (_get_tied_weight_keys calls .keys()).
+    # We use an empty dict: each encoder layer keeps its own position_embeddings.
+    # NOTE (model-quality TODO): the original checkpoint tied all 24 layers'
+    # position_embeddings to a single tensor (layers 1-23 were absent from the
+    # checkpoint and are randomly initialised via ignore_mismatched_sizes). Properly
+    # re-tying them in the 5.x dict format would better match the pretrained design.
+    _tied_weights_keys = {}
 
     def __init__(self, config):
         super().__init__(config)
