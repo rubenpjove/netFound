@@ -178,14 +178,6 @@ def main():
         model = netFoundFinetuningModel.from_pretrained(
             model_args.model_name_or_path, config=config, ignore_mismatched_sizes=True
         )
-        # Re-initialize position_ids buffer to [0..max_position_embeddings-1].
-        # The pretrained checkpoint may store position_ids with Roberta-style offset
-        # values (e.g. [2..max+1]) that cause out-of-bounds errors in position_embeddings.
-        model.base_transformer.embeddings.register_buffer(
-            "position_ids",
-            torch.arange(config.max_position_embeddings).expand((1, -1)),
-            persistent=False,
-        )
     else:
         model = netFoundFinetuningModel(config=config)
     model = utils.possibly_freeze(model, model_args)

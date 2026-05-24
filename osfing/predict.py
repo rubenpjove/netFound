@@ -152,14 +152,6 @@ def main() -> None:  # noqa: C901 — complexity acceptable for a standalone scr
     config.p = 0  # disable augmentation
 
     model = netFoundFinetuningModel.from_pretrained(args.model_dir, config=config)
-    # Re-initialize position_ids buffer (defensive — same fix as netFoundFinetuning.py).
-    # If the saved checkpoint accidentally persisted position_ids with Roberta-style offsets,
-    # this guarantees correct [0..max_position_embeddings-1] values to avoid CUDA OOB.
-    model.base_transformer.embeddings.register_buffer(
-        "position_ids",
-        torch.arange(config.max_position_embeddings).expand((1, -1)),
-        persistent=False,
-    )
     model.eval()
 
     # ── 3. Dataset ─────────────────────────────────────────────────────────────
