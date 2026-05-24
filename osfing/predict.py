@@ -216,21 +216,35 @@ def main() -> None:  # noqa: C901 — complexity acceptable for a standalone scr
     logger.info("Running inference on %d samples…", len(dataset))
     prediction_output = trainer.predict(dataset)
     # prediction_output.predictions: ndarray of shape [N, num_labels] (logits)
-    label_encoder_ids: np.ndarray = np.argmax(prediction_output.predictions, axis=-1)
+    # prediction_output.label_ids: ndarray [N] of the TRUE labels in the *same order*
+    # as predictions — this is the only order-safe source of ground truth, since a
+    # separate load_dataset() of the Arrow shards may concatenate them in a different
+    # order than the Trainer's prediction dataloader.
+    pred_le_ids: np.ndarray = np.argmax(prediction_output.predictions, axis=-1)
+    true_le_ids = prediction_output.label_ids
 
-    # ── 5. Decode predictions → pipeline integer IDs ───────────────────────────
-    pred_str_labels = label_encoder.inverse_transform(label_encoder_ids)
+    # ── 5. Decode predictions + ground truth → pipeline integer IDs ─────────────
+    pred_str_labels = label_encoder.inverse_transform(pred_le_ids)
     pred_our_ids = [label2id[lbl] for lbl in pred_str_labels]
+    if true_le_ids is not None:
+        true_str_labels = label_encoder.inverse_transform(np.asarray(true_le_ids).astype(int))
+        true_our_ids = [label2id[lbl] for lbl in true_str_labels]
+    else:
+        true_our_ids = [-1] * len(pred_our_ids)
 
     # ── 6. Write predictions.tsv ───────────────────────────────────────────────
+    # Two columns: predicted label and ground-truth label, perfectly aligned (both
+    # come from the same Trainer.predict() output). Downstream metric_evaluation and
+    # plots read the ground truth from column 2 for netFound, avoiding any Arrow
+    # re-read ordering mismatch. Column 1 ("label") keeps ET-BERT compatibility.
     out_path = Path(args.prediction_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write("label\n")
-        for pid in pred_our_ids:
-            fh.write(f"{pid}\n")
+        fh.write("label\ttrue\n")
+        for pid, tid in zip(pred_our_ids, true_our_ids):
+            fh.write(f"{pid}\t{tid}\n")
 
-    logger.info("Wrote %d predictions to %s", len(pred_our_ids), out_path)
+    logger.info("Wrote %d predictions (with aligned ground truth) to %s", len(pred_our_ids), out_path)
 
 
 if __name__ == "__main__":
