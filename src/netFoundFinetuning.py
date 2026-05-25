@@ -60,6 +60,17 @@ class FineTuningDataTrainingArguments(utils.CommonDataTrainingArguments):
             "help": "noise rate"
         },
     )
+    prediction_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "When set together with --do_predict, run inference on test_dir and write "
+                "a TSV here with two aligned columns ('label'=predicted, 'true'=ground truth), "
+                "both in the pipeline's label2id integer space (from --label_maps). This reuses "
+                "the exact eval machinery, replacing the separate osfing/predict.py."
+            )
+        },
+    )
 
 def get_label_encoder(problem_type: str, dataset = None, batch_size = 1):
     """
@@ -229,6 +240,31 @@ def main():
         metrics = trainer.evaluate(eval_dataset=test_dataset)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+
+    if training_args.do_predict and data_args.prediction_path and data_args.problem_type != "regression":
+        # Inference path for the NTFM-OSfing pipeline. Runs the SAME trainer / model /
+        # tokenizer / LabelEncoder used by --do_eval (which is the machinery that yields
+        # the correct accuracy), then writes predictions.tsv with two aligned columns
+        # ('label'=predicted, 'true'=ground truth) in the pipeline's label2id space.
+        # Replaces the divergent standalone osfing/predict.py.
+        import json as _json
+        import numpy as _np
+        logger.warning("*** Predict → %s ***", data_args.prediction_path)
+        pred_out = trainer.predict(test_dataset)
+        preds_arr = pred_out.predictions[0] if isinstance(pred_out.predictions, tuple) else pred_out.predictions
+        pred_le = _np.asarray(preds_arr).argmax(axis=-1).astype(int)
+        true_le = _np.asarray(pred_out.label_ids).astype(int)
+        pred_str = label_encoder.inverse_transform(pred_le)
+        true_str = label_encoder.inverse_transform(true_le)
+        with open(data_args.label_maps, encoding="utf-8") as _fh:
+            _l2id = _json.load(_fh)["label2id"]
+        out_path = data_args.prediction_path
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as _out:
+            _out.write("label\ttrue\n")
+            for _p, _t in zip(pred_str, true_str):
+                _out.write(f"{_l2id[str(_p)]}\t{_l2id[str(_t)]}\n")
+        logger.warning("Wrote %d predictions (label<TAB>true) to %s", len(pred_le), out_path)
 
 
 if __name__ == "__main__":
