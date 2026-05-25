@@ -262,7 +262,8 @@ def get_logger(name):
 def verify_checkpoint(logger, training_args):
     if not training_args.resume_from_checkpoint:
         folders = set(os.listdir(training_args.output_dir)) - {"runs"}
-        if len(folders) > 0 and not training_args.overwrite_output_dir:
+        # transformers 5.x removed TrainingArguments.overwrite_output_dir; default to False.
+        if len(folders) > 0 and not getattr(training_args, "overwrite_output_dir", False):
             if training_args.local_rank == 0:
                 raise ValueError(
                     f"Output directory ({training_args.output_dir}) already exists and is not empty. "
