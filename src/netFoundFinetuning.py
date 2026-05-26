@@ -71,6 +71,18 @@ class FineTuningDataTrainingArguments(utils.CommonDataTrainingArguments):
             )
         },
     )
+    diagnose_saveload: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Diagnostic mode: after --do_train + save_model(), reload the model from disk "
+                "and compare it against the in-memory model (eval metrics, state_dict diff, raw "
+                "safetensors keys, from_pretrained loading_info, forward input-dependence, and "
+                "checkpoint-NNN vs top-level). Writes saveload_diagnostic.json to output_dir. "
+                "No-op for normal runs."
+            )
+        },
+    )
 
 def get_label_encoder(problem_type: str, dataset = None, batch_size = 1):
     """
@@ -99,6 +111,222 @@ def get_label_encoder(problem_type: str, dataset = None, batch_size = 1):
         return _batch
 
     return encoder, mapping_function
+
+
+def _cpu_clone_state_dict(model):
+    # Strip the torch.compile "_orig_mod." prefix so keys line up with a non-compiled reload.
+    def _norm(k):
+        return k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k
+    return {_norm(k): v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+
+
+def _safetensors_keys_shapes(model_dir):
+    """Keys + shapes actually stored on disk (handles single or sharded safetensors)."""
+    import glob as _glob
+    out = {}
+    files = sorted(_glob.glob(os.path.join(model_dir, "*.safetensors")))
+    try:
+        from safetensors import safe_open
+    except Exception as exc:  # pragma: no cover
+        return {"__error__": f"safetensors unavailable: {exc}"}, [os.path.basename(f) for f in files]
+    for f in files:
+        try:
+            with safe_open(f, framework="pt") as st:
+                for k in st.keys():
+                    out[k] = list(st.get_slice(k).get_shape())
+        except Exception as exc:
+            out[f"__error__{os.path.basename(f)}"] = str(exc)
+    return out, [os.path.basename(f) for f in files]
+
+
+def _state_dict_diff(sd_mem, sd_reload):
+    import torch as _torch
+    keys_mem, keys_rl = set(sd_mem), set(sd_reload)
+    only_in_memory = sorted(keys_mem - keys_rl)
+    only_in_reload = sorted(keys_rl - keys_mem)
+    differing = []
+    for k in sorted(keys_mem & keys_rl):
+        a, b = sd_mem[k], sd_reload[k]
+        if list(a.shape) != list(b.shape):
+            differing.append({"key": k, "reason": "shape", "mem": list(a.shape), "reload": list(b.shape)})
+            continue
+        a32, b32 = a.float(), b.float()
+        if not _torch.allclose(a32, b32, atol=1e-5, rtol=1e-4):
+            differing.append({"key": k, "reason": "value", "max_abs_diff": float((a32 - b32).abs().max())})
+    return only_in_memory, only_in_reload, differing
+
+
+def _input_dependence(predictions):
+    """Is the model output input-dependent, or collapsed/constant?"""
+    import numpy as _np
+    logits = predictions[0] if isinstance(predictions, tuple) else predictions
+    logits = _np.asarray(logits, dtype=_np.float64)
+    if logits.ndim != 2:
+        logits = logits.reshape(logits.shape[0], -1)
+    argmax = logits.argmax(axis=-1)
+    uniq, counts = _np.unique(argmax, return_counts=True)
+    return {
+        "n_samples": int(logits.shape[0]),
+        "n_unique_predictions": int(len(uniq)),
+        "prediction_class_counts": {int(u): int(c) for u, c in zip(uniq, counts)},
+        # ~0 => logits barely change across samples => input-independent (collapsed)
+        "mean_logit_std_across_samples": float(logits.std(axis=0).mean()),
+    }
+
+
+def _eval_with_fresh_trainer(model, training_args, test_dataset, testing_tokenizer,
+                             compute_metrics, data_collator):
+    """Evaluate + predict a (reloaded) model through the SAME machinery as training-time eval."""
+    model = model.to(training_args.device)
+    model.eval()
+    diag_trainer = netFoundTrainer(
+        model=model,
+        args=training_args,
+        eval_dataset=test_dataset,
+        processing_class=testing_tokenizer,
+        compute_metrics=compute_metrics,
+        data_collator=data_collator,
+    )
+    metrics = diag_trainer.evaluate(eval_dataset=test_dataset)
+    pred = diag_trainer.predict(test_dataset)
+    return metrics, pred
+
+
+def run_saveload_diagnostic(logger, in_memory_trainer, config, training_args, test_dataset,
+                            data_collator, testing_tokenizer, compute_metrics):
+    """
+    Localize the netFound save/load bug (reloaded model → random inference).
+
+    Compares the in-memory fine-tuned model against the same model reloaded from disk:
+    eval metrics, state_dict tensor-by-tensor diff, raw safetensors keys on disk,
+    from_pretrained loading_info (authoritative missing/unexpected/mismatched keys),
+    forward input-dependence, and top-level model.safetensors vs latest checkpoint-NNN.
+
+    Writes <output_dir>/saveload_diagnostic.json. Never raises (best-effort diagnostic).
+    """
+    import math
+    import json as _json
+    from transformers.trainer_utils import get_last_checkpoint
+
+    out_dir = training_args.output_dir
+    report = {"output_dir": out_dir}
+    logger.warning("*** SAVE/LOAD DIAGNOSTIC (--diagnose_saveload) ***")
+
+    try:
+        num_labels = int(getattr(config, "num_labels", 0) or 0)
+        report["num_labels"] = num_labels
+        report["expected_random_eval_loss_ln_num_labels"] = math.log(num_labels) if num_labels > 0 else None
+
+        # 1. In-memory baseline (the model that scores ~0.77) + its predictions + state_dict.
+        m_inmem = in_memory_trainer.evaluate(eval_dataset=test_dataset)
+        pred_inmem = in_memory_trainer.predict(test_dataset)
+        sd_mem = _cpu_clone_state_dict(in_memory_trainer.model)
+        report["in_memory"] = {
+            "eval": {k: float(v) for k, v in m_inmem.items() if isinstance(v, (int, float))},
+            "input_dependence": _input_dependence(pred_inmem.predictions),
+        }
+
+        # 4/5. Raw safetensors on disk (what save_model actually wrote).
+        disk_keys, st_files = _safetensors_keys_shapes(out_dir)
+        sd_mem_keys = set(sd_mem.keys())
+        report["safetensors"] = {
+            "files": st_files,
+            "n_keys_on_disk": len([k for k in disk_keys if not k.startswith("__error__")]),
+            "n_keys_in_memory_state_dict": len(sd_mem_keys),
+            "keys_in_memory_but_not_on_disk": sorted(sd_mem_keys - set(disk_keys)),
+            "keys_on_disk_but_not_in_memory": sorted(set(disk_keys) - sd_mem_keys - {
+                k for k in disk_keys if k.startswith("__error__")}),
+            "errors": {k: v for k, v in disk_keys.items() if k.startswith("__error__")},
+        }
+
+        # 2. Reload top-level model with authoritative loading_info.
+        reloaded, loading_info = netFoundFinetuningModel.from_pretrained(
+            out_dir, config=config, ignore_mismatched_sizes=True, output_loading_info=True
+        )
+        report["from_pretrained_loading_info"] = {
+            "missing_keys": list(loading_info.get("missing_keys", [])),
+            "unexpected_keys": list(loading_info.get("unexpected_keys", [])),
+            "mismatched_keys": list(loading_info.get("mismatched_keys", [])),
+            "error_msgs": list(loading_info.get("error_msgs", [])),
+        }
+
+        # 3. State-dict tensor-by-tensor diff (in-memory vs reloaded).
+        only_mem, only_rl, differing = _state_dict_diff(sd_mem, reloaded.state_dict())
+        report["state_dict_diff"] = {
+            "n_keys_differing": len(differing),
+            "keys_only_in_memory": only_mem,
+            "keys_only_in_reload": only_rl,
+            "differing": differing[:200],  # cap for readability
+        }
+
+        # 6 + 7. Reloaded eval + input-dependence (same eval machinery).
+        m_reload, pred_reload = _eval_with_fresh_trainer(
+            reloaded, training_args, test_dataset, testing_tokenizer, compute_metrics, data_collator
+        )
+        report["reloaded_top_level"] = {
+            "eval": {k: float(v) for k, v in m_reload.items() if isinstance(v, (int, float))},
+            "input_dependence": _input_dependence(pred_reload.predictions),
+        }
+        del reloaded
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # 8. Latest checkpoint-NNN vs top-level (TODO diag #1).
+        last_ckpt = get_last_checkpoint(out_dir)
+        report["last_checkpoint"] = last_ckpt
+        if last_ckpt:
+            ckpt_disk_keys, ckpt_files = _safetensors_keys_shapes(last_ckpt)
+            ckpt_model, ckpt_loading_info = netFoundFinetuningModel.from_pretrained(
+                last_ckpt, config=config, ignore_mismatched_sizes=True, output_loading_info=True
+            )
+            _, _, ckpt_differing = _state_dict_diff(sd_mem, ckpt_model.state_dict())
+            m_ckpt, pred_ckpt = _eval_with_fresh_trainer(
+                ckpt_model, training_args, test_dataset, testing_tokenizer, compute_metrics, data_collator
+            )
+            report["reloaded_checkpoint"] = {
+                "safetensors_files": ckpt_files,
+                "n_keys_on_disk": len([k for k in ckpt_disk_keys if not k.startswith("__error__")]),
+                "missing_keys": list(ckpt_loading_info.get("missing_keys", [])),
+                "mismatched_keys": list(ckpt_loading_info.get("mismatched_keys", [])),
+                "n_state_dict_keys_differing_vs_memory": len(ckpt_differing),
+                "eval": {k: float(v) for k, v in m_ckpt.items() if isinstance(v, (int, float))},
+                "input_dependence": _input_dependence(pred_ckpt.predictions),
+            }
+            del ckpt_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Headline verdict.
+        inmem_loss = report["in_memory"]["eval"].get("eval_loss")
+        reload_loss = report["reloaded_top_level"]["eval"].get("eval_loss")
+        report["verdict"] = {
+            "in_memory_eval_loss": inmem_loss,
+            "reloaded_eval_loss": reload_loss,
+            "reload_collapsed": (
+                reload_loss is not None
+                and report["expected_random_eval_loss_ln_num_labels"] is not None
+                and abs(reload_loss - report["expected_random_eval_loss_ln_num_labels"]) < 0.15
+            ),
+        }
+    except Exception as exc:  # never crash the run on a diagnostic failure
+        import traceback
+        report["diagnostic_error"] = f"{type(exc).__name__}: {exc}"
+        report["diagnostic_traceback"] = traceback.format_exc()
+        logger.warning("save/load diagnostic raised: %s", exc)
+
+    out_path = os.path.join(out_dir, "saveload_diagnostic.json")
+    try:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            _json.dump(report, fh, indent=2, default=str)
+        logger.warning("Wrote save/load diagnostic to %s", out_path)
+    except Exception as exc:
+        logger.warning("Could not write %s: %s", out_path, exc)
+    logger.warning("DIAGNOSTIC SUMMARY: %s", _json.dumps(report.get("verdict", {}), default=str))
+    logger.warning("DIAGNOSTIC state_dict differing keys: %s", report.get("state_dict_diff", {}).get("n_keys_differing"))
+    logger.warning("DIAGNOSTIC from_pretrained missing/mismatched: %s / %s",
+                   report.get("from_pretrained_loading_info", {}).get("missing_keys"),
+                   report.get("from_pretrained_loading_info", {}).get("mismatched_keys"))
+    return report
 
 
 @record
@@ -234,6 +462,18 @@ def main():
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
+
+        if getattr(data_args, "diagnose_saveload", False):
+            run_saveload_diagnostic(
+                logger=logger,
+                in_memory_trainer=trainer,
+                config=config,
+                training_args=training_args,
+                test_dataset=test_dataset,
+                data_collator=data_collator,
+                testing_tokenizer=testing_tokenizer,
+                compute_metrics=compute_metrics,
+            )
 
     if training_args.do_eval:
         logger.warning("*** Evaluate ***")
