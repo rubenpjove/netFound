@@ -296,6 +296,74 @@ def run_saveload_diagnostic(logger, in_memory_trainer, config, training_args, te
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+        # 9. Save-vs-load determination + candidate-fix bake-off (all in one job).
+        #    Decides whether the on-disk file is correct (=> load bug) or corrupt
+        #    (=> save bug), and tests reload strategies that bypass the fragile
+        #    fast-init/meta-device path. The winner is the one whose eval matches
+        #    the in-memory model (~the in_memory eval_loss) with ~0 differing keys.
+        st_path = os.path.join(out_dir, "model.safetensors")
+        file_sd = None
+        try:
+            from safetensors.torch import load_file as _load_file
+            file_sd = _load_file(st_path)
+            _, _, file_diff = _state_dict_diff(sd_mem, file_sd)
+            report["file_vs_memory"] = {
+                "n_keys_differing": len(file_diff),
+                "interpretation": (
+                    "SAVE bug: on-disk file != trained weights"
+                    if len(file_diff) else
+                    "file == trained weights => LOAD bug (from_pretrained not materializing)"
+                ),
+                "sample": file_diff[:10],
+            }
+        except Exception as exc:
+            report["file_vs_memory"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        fixes = {}
+        # Candidate A: from_pretrained with fast-init disabled.
+        try:
+            mA, _ = netFoundFinetuningModel.from_pretrained(
+                out_dir, config=config, ignore_mismatched_sizes=True,
+                low_cpu_mem_usage=False, output_loading_info=True,
+            )
+            _, _, dA = _state_dict_diff(sd_mem, mA.state_dict())
+            eA, _ = _eval_with_fresh_trainer(
+                mA, training_args, test_dataset, testing_tokenizer, compute_metrics, data_collator)
+            fixes["from_pretrained_low_cpu_mem_usage_false"] = {
+                "n_state_dict_keys_differing_vs_memory": len(dA),
+                "eval_loss": float(eA.get("eval_loss")) if eA.get("eval_loss") is not None else None,
+                "eval_accuracy": float(eA.get("eval_accuracy")) if eA.get("eval_accuracy") is not None else None,
+            }
+            del mA
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            import traceback as _tb
+            fixes["from_pretrained_low_cpu_mem_usage_false"] = {"error": f"{type(exc).__name__}: {exc}", "tb": _tb.format_exc()[-800:]}
+
+        # Candidate B: fresh model() + manual load_state_dict from the safetensors file.
+        if file_sd is not None:
+            try:
+                mB = netFoundFinetuningModel(config)
+                load_res = mB.load_state_dict(file_sd, strict=False)
+                _, _, dB = _state_dict_diff(sd_mem, mB.state_dict())
+                eB, _ = _eval_with_fresh_trainer(
+                    mB, training_args, test_dataset, testing_tokenizer, compute_metrics, data_collator)
+                fixes["fresh_model_load_state_dict"] = {
+                    "n_missing": len(load_res.missing_keys),
+                    "n_unexpected": len(load_res.unexpected_keys),
+                    "n_state_dict_keys_differing_vs_memory": len(dB),
+                    "eval_loss": float(eB.get("eval_loss")) if eB.get("eval_loss") is not None else None,
+                    "eval_accuracy": float(eB.get("eval_accuracy")) if eB.get("eval_accuracy") is not None else None,
+                }
+                del mB
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as exc:
+                import traceback as _tb
+                fixes["fresh_model_load_state_dict"] = {"error": f"{type(exc).__name__}: {exc}", "tb": _tb.format_exc()[-800:]}
+        report["candidate_fixes"] = fixes
+
         # Headline verdict.
         inmem_loss = report["in_memory"]["eval"].get("eval_loss")
         reload_loss = report["reloaded_top_level"]["eval"].get("eval_loss")
@@ -326,6 +394,9 @@ def run_saveload_diagnostic(logger, in_memory_trainer, config, training_args, te
     logger.warning("DIAGNOSTIC from_pretrained missing/mismatched: %s / %s",
                    report.get("from_pretrained_loading_info", {}).get("missing_keys"),
                    report.get("from_pretrained_loading_info", {}).get("mismatched_keys"))
+    logger.warning("DIAGNOSTIC file_vs_memory: %s", _json.dumps(report.get("file_vs_memory", {}).get("interpretation")
+                                                                or report.get("file_vs_memory", {}), default=str))
+    logger.warning("DIAGNOSTIC candidate_fixes: %s", _json.dumps(report.get("candidate_fixes", {}), default=str))
     return report
 
 
