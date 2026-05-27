@@ -113,6 +113,60 @@ def get_label_encoder(problem_type: str, dataset = None, batch_size = 1):
     return encoder, mapping_function
 
 
+def load_finetuning_model(config, model_path, logger):
+    """Build a netFoundFinetuningModel and load its weights from disk reliably.
+
+    Why not ``from_pretrained``: under transformers 5.8.1, ``from_pretrained``
+    SILENTLY FAILS to materialize this custom nested PreTrainedModel — it reports
+    a clean load (0 missing/unexpected/mismatched) yet leaves every parameter at
+    its random ``__init__`` value, so a reloaded fine-tuned model performs at
+    random (eval_loss = ln(num_classes)). Disabling fast-init
+    (``low_cpu_mem_usage=False``) does NOT help. Diagnosed with --diagnose_saveload:
+    the on-disk safetensors is byte-correct (== the trained weights), and a plain
+    ``load_state_dict`` reproduces the in-memory model exactly.
+
+    We therefore build the model and load the state_dict directly. Shape-mismatched
+    tensors are skipped (mirrors ``ignore_mismatched_sizes=True``, needed for the
+    pretrained checkpoint whose protoEmbedding/MLP shapes differ from the
+    fine-tuning head's config); missing/unexpected keys are tolerated (strict=False).
+    """
+    import glob
+    model = netFoundFinetuningModel(config)
+    src = {}
+    st_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if st_files:
+        from safetensors.torch import load_file
+        for f in st_files:
+            src.update(load_file(f))
+    else:
+        bin_path = os.path.join(model_path, "pytorch_model.bin")
+        if os.path.isfile(bin_path):
+            src = torch.load(bin_path, map_location="cpu")
+        else:
+            raise FileNotFoundError(
+                f"No model weights (*.safetensors or pytorch_model.bin) found in {model_path}"
+            )
+    own = model.state_dict()
+    filtered = {}
+    skipped_shape = []
+    for k, v in src.items():
+        if k in own and own[k].shape == v.shape:
+            filtered[k] = v
+        elif k in own:
+            skipped_shape.append((k, list(v.shape), list(own[k].shape)))
+    load_res = model.load_state_dict(filtered, strict=False)
+    logger.warning(
+        "load_finetuning_model(%s): loaded %d/%d tensors (skipped %d shape-mismatched, "
+        "%d missing, %d unexpected)",
+        model_path, len(filtered), len(src), len(skipped_shape),
+        len(load_res.missing_keys), len(load_res.unexpected_keys),
+    )
+    if skipped_shape:
+        logger.warning("  shape-mismatched (kept at init): %s",
+                       [s[0] for s in skipped_shape][:20])
+    return model
+
+
 def _cpu_clone_state_dict(model):
     # Strip the torch.compile "_orig_mod." prefix so keys line up with a non-compiled reload.
     def _norm(k):
@@ -485,9 +539,13 @@ def main():
             model_args.model_name_or_path
     ):
         logger.warning(f"Using weights from {model_args.model_name_or_path}")
-        model = netFoundFinetuningModel.from_pretrained(
-            model_args.model_name_or_path, config=config, ignore_mismatched_sizes=True
-        )
+        # NOTE: do NOT use netFoundFinetuningModel.from_pretrained here — under
+        # transformers 5.8.1 it silently fails to materialize this custom nested
+        # model (reports a clean load but leaves all weights at random init), so a
+        # reloaded fine-tuned model performs at random. load_finetuning_model builds
+        # the model and loads the state_dict directly (verified to reproduce the
+        # in-memory model exactly). See its docstring + TODO.md "Bug bloqueante".
+        model = load_finetuning_model(config, model_args.model_name_or_path, logger)
     else:
         model = netFoundFinetuningModel(config=config)
     model = utils.possibly_freeze(model, model_args)
