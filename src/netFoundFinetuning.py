@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 from torch.distributed.elastic.multiprocessing.errors import record
 from datasets import concatenate_datasets
 from datasets.distributed import split_dataset_by_node
-from transformers import HfArgumentParser, TrainingArguments
+from transformers import HfArgumentParser, TrainingArguments, TrainerCallback
 
 from modules.metrics import classif_metrics, regression_metrics
 from modules import utils
@@ -30,6 +30,82 @@ from modules.netFoundTrainer import netFoundTrainer
 from modules.netFoundTokenizer import netFoundTokenizer
 
 random.seed(42)
+
+
+class MLflowEpochParityCallback(TrainerCallback):
+    """Log per-epoch metrics to MLflow with the SAME names and step semantics as the
+    ET-BERT path, so ET-BERT and netFound runs are directly comparable in MLflow.
+
+    The NTFM-OSfing pipeline runs both NTFMs with --report_to none and relies on this
+    callback instead of HF's built-in MLflowCallback, which (a) logs metrics at the
+    global optimizer step rather than the epoch index — making ``best_epoch`` mean
+    different things across NTFMs — and (b) dumps every TrainingArguments field as an
+    MLflow param. This callback logs only metrics, keyed by epoch:
+
+        train.loss      (from the per-epoch training log; needs logging_strategy=epoch)
+        dev.accuracy    (eval_accuracy)
+        dev.f1_macro    (eval_f1_macro)
+        dev.f1_weighted (eval_weighted_f1)
+        dev.loss        (eval_loss)
+
+    matching ET-BERT's run_classifier.py (train.loss / dev.accuracy / dev.f1_macro,
+    step=epoch). Active only when the parent passes MLFLOW_RUN_ID / MLFLOW_TRACKING_URI
+    via the environment; otherwise every method is a no-op."""
+
+    _EVAL_NAME_MAP = {
+        "eval_accuracy": "dev.accuracy",
+        "eval_f1_macro": "dev.f1_macro",
+        "eval_weighted_f1": "dev.f1_weighted",
+        "eval_loss": "dev.loss",
+    }
+
+    def __init__(self):
+        self._run_id = os.environ.get("MLFLOW_RUN_ID")
+        self._client = None
+        if self._run_id:
+            try:
+                import mlflow
+                uri = os.environ.get("MLFLOW_TRACKING_URI")
+                if uri:
+                    mlflow.set_tracking_uri(uri)
+                self._client = mlflow.tracking.MlflowClient()
+            except Exception:
+                self._client = None
+
+    @staticmethod
+    def _epoch(state):
+        try:
+            return int(round(state.epoch)) if state.epoch is not None else 0
+        except Exception:
+            return 0
+
+    def _active(self, state):
+        return (
+            self._client is not None
+            and self._run_id
+            and getattr(state, "is_world_process_zero", True)
+        )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # Per-epoch training loss (key "loss"); the final summary uses "train_loss"
+        # and is intentionally skipped here.
+        if not self._active(state) or not logs or "loss" not in logs:
+            return
+        try:
+            self._client.log_metric(self._run_id, "train.loss", float(logs["loss"]), step=self._epoch(state))
+        except Exception:
+            pass
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not self._active(state) or not metrics:
+            return
+        ep = self._epoch(state)
+        for src, dst in self._EVAL_NAME_MAP.items():
+            if src in metrics:
+                try:
+                    self._client.log_metric(self._run_id, dst, float(metrics[src]), step=ep)
+                except Exception:
+                    pass
 
 
 @dataclass
@@ -577,6 +653,9 @@ def main():
     trainer.add_callback(utils.StepSyncCallback())
     trainer.add_callback(utils.LearningRateLogCallback(utils.TB_WRITER))
     trainer.add_callback(utils.ThroughputTimingCallback(utils.TB_WRITER))
+    # MLflow per-epoch logging with ET-BERT-matching names/steps (the pipeline runs
+    # with --report_to none and relies on this instead of HF's MLflowCallback).
+    trainer.add_callback(MLflowEpochParityCallback())
     utils.start_gpu_logging(training_args.output_dir)
     utils.start_cpu_logging(training_args.output_dir)
     utils.start_ram_logging(training_args.output_dir)
