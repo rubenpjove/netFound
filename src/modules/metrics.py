@@ -35,6 +35,9 @@ def classif_metrics(p: EvalPrediction, label_encoder: LabelEncoder):
         preds = logits.argmax(axis=1)
         raw_scores = logits  # needed for top_k_accuracy_score
 
+    macro_f1 = f1_score(
+        y_true=label_ids, y_pred=preds, average="macro", zero_division=0, labels=labels,
+    )
     weighted_f1 = f1_score(
         y_true=label_ids, y_pred=preds, average="weighted", zero_division=0, labels=labels,
     )
@@ -54,6 +57,7 @@ def classif_metrics(p: EvalPrediction, label_encoder: LabelEncoder):
         if num_classes > 10:
             logger.warning(f"top10:{top_k_accuracy_score(label_ids, raw_scores, k=10, labels=np.arange(num_classes))}")
     return {
+        "f1_macro": macro_f1,
         "weighted_f1": weighted_f1,
         "accuracy": accuracy,
         "weighted_prec": weighted_prec,
