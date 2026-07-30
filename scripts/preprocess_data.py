@@ -1,4 +1,5 @@
 import argparse
+import shutil
 import subprocess
 import os
 import logging
@@ -22,13 +23,28 @@ def get_args():
     parser.add_argument("--tcp_options", action="store_true", default=False, help="Include TCP options in the tokenized data.")
     parser.add_argument("--combined", action="store_true", default=False,
                         help="Combine all the pcap files in the /final/shards into a single file (suitable for small datasets).")
+    parser.add_argument("--keep_intermediates", action="store_true", default=False,
+                        help="Keep the per-label filtered/split/extracted (and, with --combined, shards) "
+                             "trees instead of deleting each one as soon as it is consumed. The default "
+                             "cleanup keeps the peak inode footprint at one label's worth instead of the "
+                             "whole dataset's (critical on inode-quota'd filesystems like Lustre).")
 
     return parser
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess:
     logger.info(f"Running command: {' '.join(command)}")
-    process = subprocess.run(command, check=True, capture_output=True)
+    try:
+        process = subprocess.run(command, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        # Without this, the captured output of a FAILING stage is silently
+        # discarded with the exception and the real error (e.g. "Disk quota
+        # exceeded") never reaches any log.
+        if e.stdout:
+            logger.error("[failed: stdout] %s", e.stdout.decode(errors="replace"))
+        if e.stderr:
+            logger.error("[failed: stderr] %s", e.stderr.decode(errors="replace"))
+        raise
     if process.stderr:
         logger.error(process.stderr.decode())
     if process.stdout:
@@ -85,6 +101,19 @@ def preprocess_finetune(args):
                 run(["python3", f"{base_directory}/pre_process_src/CollectTokensInFiles.py",
                      os.path.join(f"{input_folder}/final/shards/{label}", folder_name),
                      os.path.join(f"{input_folder}/final/combined", f"{label}_{folder_name}.arrow")])
+
+        if not args.keep_intermediates:
+            # This label's chain intermediates are fully consumed at this point
+            # (shards too, once collected into final/combined). Dropping them per
+            # label caps the peak inode usage at ~one label's tree; accumulating
+            # all labels' split/extracted/shard files across a whole dataset is
+            # what pushed multi-task runs over the Lustre file quota.
+            stages = ["filtered", "split", "extracted"]
+            if args.combined:
+                stages.append("final/shards")
+            for stage in stages:
+                shutil.rmtree(os.path.join(input_folder, stage, label), ignore_errors=True)
+
 
 def main():
     parser = get_args()

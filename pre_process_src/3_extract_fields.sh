@@ -41,4 +41,17 @@ find "$input_folder" -mindepth 1 -maxdepth 1 -type d -print0 | while IFS= read -
     mkdir -p "$output_folder/$dir_name"
 done
 
-find "$input_folder" -mindepth 1 -maxdepth 1 -type d -print0 | parallel -0 "$field_extraction_script {} $output_folder/{/} $tcpoptions"
+# --joblog records each job's exit code so a failing/crashing extraction is
+# attributable to a concrete directory (parallel's own exit code only says HOW
+# MANY jobs failed). The joblog lives in TMPDIR, never in output_folder, which
+# downstream stages list as tokenizer inputs.
+joblog="$(mktemp)"
+rc=0
+find "$input_folder" -mindepth 1 -maxdepth 1 -type d -print0 | \
+    parallel -0 --joblog "$joblog" "$field_extraction_script {} $output_folder/{/} $tcpoptions" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "3_extract_fields.sh: parallel reported $rc failed job(s) for '$input_folder'. Joblog:" >&2
+    cat "$joblog" >&2
+fi
+rm -f "$joblog"
+exit "$rc"

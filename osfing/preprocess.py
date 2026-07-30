@@ -211,6 +211,7 @@ def _run_preprocess_for_split(
     preprocess_script: Path,
     tokenizer_config: str,
     tcp_options: bool,
+    keep_intermediates: bool = False,
 ) -> None:
     """Invoke ``scripts/preprocess_data.py --action finetune --combined`` for one split."""
     cmd = [
@@ -223,6 +224,8 @@ def _run_preprocess_for_split(
     ]
     if tcp_options:
         cmd.append("--tcp_options")
+    if keep_intermediates:
+        cmd.append("--keep_intermediates")
 
     logger.info("[%s] Running: %s", split_name, " ".join(cmd))
     result = subprocess.run(cmd, check=False, text=True, capture_output=True)
@@ -286,6 +289,7 @@ def main() -> None:
             preprocess_script=preprocess_script,
             tokenizer_config=args.tokenizer_config,
             tcp_options=args.tcp_options,
+            keep_intermediates=args.keep_work_dir,
         )
 
         # Move combined Arrow files to output_dir/<split>/
@@ -310,6 +314,13 @@ def main() -> None:
 
         n_arrows = len(list(combined_dst.glob("*.arrow")))
         logger.info("  Wrote %d Arrow files to %s", n_arrows, combined_dst)
+
+        if not args.keep_work_dir:
+            # This split's Arrow output is safely in output_dir; drop the split's
+            # work tree now instead of at the end so at most one split's
+            # intermediates exist at a time (inode-quota hygiene on Lustre).
+            shutil.rmtree(split_work, ignore_errors=True)
+            logger.info("  Cleaned split work directory: %s", split_work)
 
     if not args.keep_work_dir:
         shutil.rmtree(work_dir, ignore_errors=True)
