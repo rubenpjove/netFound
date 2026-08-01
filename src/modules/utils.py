@@ -234,6 +234,54 @@ def update_config(
     return config
 
 
+def strip_training_args_from_saved_config(output_dir, config, training_args, logger=None):
+    """Post-process the config.json written by save_model().
+
+    update_config() copies every TrainingArguments field onto the live config
+    (several are needed at runtime), which pollutes the serialized artifact with
+    run-specific training settings (output_dir, logging_*, deepspeed, ...).
+    Remove from the on-disk JSON any key that is a TrainingArguments field but
+    not a legitimate parameter of the config class. File-only: the in-memory
+    config is untouched, so later do_eval/do_predict see the full config, and
+    load_finetuning_model() rebuilds from args (never from this file).
+    """
+    cfg_path = os.path.join(output_dir, "config.json")
+    if not os.path.isfile(cfg_path):
+        return []
+    if dataclasses.is_dataclass(training_args):
+        ta_keys = {f.name for f in dataclasses.fields(training_args)}
+    else:
+        ta_keys = {k for k in vars(training_args) if not k.startswith("_")}
+    keep = set(inspect.signature(type(config).__init__).parameters) - {"self", "args", "kwargs"}
+    with open(cfg_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    dropped = sorted(k for k in payload if k in ta_keys and k not in keep)
+    for k in dropped:
+        del payload[k]
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    if logger is not None and dropped:
+        logger.warning("Stripped %d TrainingArguments keys from saved config.json", len(dropped))
+    return dropped
+
+
+def apply_deterministic_mode():
+    """Opt-in single-run bit-reproducibility.
+
+    The osfing pipeline sets OSFING_DETERMINISTIC=1 (via
+    --param training.deterministic=true); no-op otherwise. Must run before any
+    CUDA kernel launches. use_deterministic_algorithms raises on ops without a
+    deterministic implementation — intentional: a silent fallback would defeat
+    the purpose. Slows training and does not remove cross-node/GPU variance.
+    """
+    if os.environ.get("OSFING_DETERMINISTIC") != "1":
+        return False
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    return True
+
+
 def possibly_freeze(model, model_args):
     for name, param in model.base_transformer.named_parameters():
         if model_args.freeze_flow_encoder and (

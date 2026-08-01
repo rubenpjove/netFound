@@ -543,6 +543,9 @@ def main():
     utils.LOGGING_LEVEL = training_args.get_process_log_level()
     logger = utils.get_logger(name=__name__)
 
+    if utils.apply_deterministic_mode():
+        logger.warning("Deterministic mode ON (torch.use_deterministic_algorithms, cuDNN benchmark off)")
+
     logger.info(f"model_args: {model_args}")
     logger.info(f"data_args: {data_args}")
     logger.info(f"training_args: {training_args}")
@@ -665,6 +668,12 @@ def main():
     if training_args.do_train:
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
+        # Cosmetic: drop the TrainingArguments fields that update_config() copied
+        # onto the config from the serialized config.json (file-only; the live
+        # config keeps them for the rest of this process).
+        utils.strip_training_args_from_saved_config(
+            training_args.output_dir, config, training_args, logger=logger
+        )
         metrics = train_result.metrics
 
         trainer.log_metrics("train", metrics)
