@@ -44,7 +44,7 @@ class EpochLogCallback(TrainerCallback):
     optimizer step rather than the epoch index — making ``best_epoch`` mean different
     things across NTFMs — and (b) dump every TrainingArguments field. This callback
     appends one record per hook to the file named by the OSFING_EPOCH_LOG environment
-    variable (one YAML sequence item per line: ``- `` + JSON, flushed + fsynced so a
+    variable (JSON Lines: one JSON object per line, flushed + fsynced so a
     killed job keeps every finished epoch):
 
         on_log       -> {epoch, epoch_float, global_step, train.loss, learning_rate, grad_norm}
@@ -92,7 +92,7 @@ class EpochLogCallback(TrainerCallback):
                 for k, v in record.items()
             }
             with open(self._path, "a", encoding="utf-8") as f:
-                f.write("- " + json.dumps(clean) + "\n")
+                f.write(json.dumps(clean) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
         except Exception:
@@ -754,14 +754,12 @@ def main():
     if training_args.do_predict and data_args.prediction_path and data_args.problem_type != "regression":
         # Inference path for the NTFM-OSfing pipeline. Runs the SAME trainer / model /
         # tokenizer / LabelEncoder used by --do_eval (which is the machinery that yields
-        # the correct accuracy), then writes the per-sample record the pipeline expects:
-        #   predictions.tsv   label (predicted id) / true (ground-truth id) / p_pred
-        #                     (softmax probability of the predicted class) / capture_key
-        #                     (source capture of the flow), all in the pipeline's label2id space
-        #   probabilities.csv full softmax matrix, one row per sample in the same order,
-        #                     columns = pipeline label ids in ascending order
-        # Replaces the divergent standalone osfing/predict.py.
-        import csv as _csv
+        # the correct accuracy), then dumps a RAW per-sample TSV that the pipeline converts
+        # into its predictions.csv (osfing/pipeline/testing.py):
+        #   label        predicted id (pipeline label2id space)
+        #   true         ground-truth id
+        #   capture_key  source capture of the flow (the Arrow's source_file column)
+        #   prob         softmax over the logits, space-separated, in pipeline label-id order
         import json as _json
         import numpy as _np
         logger.warning("*** Predict → %s ***", data_args.prediction_path)
@@ -776,9 +774,7 @@ def main():
         pred_str = label_encoder.inverse_transform(pred_le)
         true_str = label_encoder.inverse_transform(true_le)
         with open(data_args.label_maps, encoding="utf-8") as _fh:
-            _label_maps_json = _json.load(_fh)
-        _l2id = _label_maps_json["label2id"]
-        _id2label = _label_maps_json.get("id2label", {})
+            _l2id = _json.load(_fh)["label2id"]
         # Capture identity per flow: the Arrow's ``source_file`` column (written by
         # pre_process_src/Tokenize.py) survives the tokenizer map, and trainer.predict()
         # keeps the dataset order, so it aligns with pred_le row by row.
@@ -797,46 +793,28 @@ def main():
         except Exception as _exc:
             logger.warning("Could not read the source_file column: %s", _exc)
             _sources = None
-        out_path = data_args.prediction_path
-        out_dir = os.path.dirname(os.path.abspath(out_path))
-        os.makedirs(out_dir, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as _out:
-            _out.write("label\ttrue\tp_pred\tcapture_key\n")
-            for _i, (_p, _t) in enumerate(zip(pred_str, true_str)):
-                _ck = _sources[_i] if _sources is not None else ""
-                _out.write(
-                    f"{_l2id[str(_p)]}\t{_l2id[str(_t)]}\t{probs[_i, pred_le[_i]]:.4f}\t{_ck}\n"
-                )
-        # probabilities.csv — reorder the LabelEncoder's (sorted-name) columns into pipeline
-        # label-id order so column j is label id j.
-        _prob_path = os.path.join(out_dir, "probabilities.csv")
+        # Probability columns: the LabelEncoder's (sorted-name) order -> pipeline label-id order.
         try:
             _col_ids = [int(_l2id[str(c)]) for c in label_encoder.classes_]
             if len(_col_ids) != probs.shape[1]:
                 raise ValueError(
                     f"LabelEncoder has {len(_col_ids)} classes but the model emits {probs.shape[1]} logits"
                 )
-            _order = _np.argsort(_col_ids)
-            _ids_sorted = [_col_ids[j] for j in _order]
-            _matrix = probs[:, _order]
+            _matrix = probs[:, _np.argsort(_col_ids)]
         except Exception as _exc:
-            logger.warning("probabilities.csv: falling back to raw logit column order (%s)", _exc)
-            _ids_sorted = list(range(probs.shape[1]))
+            logger.warning("prob column: falling back to raw logit order (%s)", _exc)
             _matrix = probs
-        with open(_prob_path, "w", encoding="utf-8", newline="") as _pf:
-            _pf.write(
-                "# columns = pipeline label ids; names: "
-                + ", ".join(f"{i}={_id2label.get(str(i), '?')}" for i in _ids_sorted)
-                + "\n"
-            )
-            _w = _csv.writer(_pf)
-            _w.writerow([str(i) for i in _ids_sorted])
-            for _row in _matrix:
-                _w.writerow([f"{v:.4f}" for v in _row])
-        logger.warning(
-            "Wrote %d predictions (label/true/p_pred/capture_key) to %s and the probability matrix to %s",
-            len(pred_le), out_path, _prob_path,
-        )
+        out_path = data_args.prediction_path
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as _out:
+            _out.write("label\ttrue\tcapture_key\tprob\n")
+            for _i, (_p, _t) in enumerate(zip(pred_str, true_str)):
+                _ck = _sources[_i] if _sources is not None else ""
+                _out.write(
+                    f"{_l2id[str(_p)]}\t{_l2id[str(_t)]}\t{_ck}\t"
+                    + " ".join(format(v, ".6g") for v in _matrix[_i]) + "\n"
+                )
+        logger.warning("Wrote %d raw predictions (label/true/capture_key/prob) to %s", len(pred_le), out_path)
 
 
 if __name__ == "__main__":
