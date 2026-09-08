@@ -5,8 +5,10 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import json
+import math
 import random
 import os
+import time
 from copy import deepcopy
 import torch
 import torch.distributed
@@ -32,45 +34,46 @@ from modules.netFoundTokenizer import netFoundTokenizer
 random.seed(42)
 
 
-class MLflowEpochParityCallback(TrainerCallback):
-    """Log per-epoch metrics to MLflow with the SAME names and step semantics as the
-    ET-BERT path, so ET-BERT and netFound runs are directly comparable in MLflow.
+class EpochLogCallback(TrainerCallback):
+    """Append per-epoch metrics to the NTFM-OSfing epoch log with the SAME names and step
+    semantics as the ET-BERT path (fine-tuning/run_classifier.py in the ET-BERT fork), so
+    ET-BERT and netFound runs are directly comparable.
 
     The NTFM-OSfing pipeline runs both NTFMs with --report_to none and relies on this
-    callback instead of HF's built-in MLflowCallback, which (a) logs metrics at the
-    global optimizer step rather than the epoch index — making ``best_epoch`` mean
-    different things across NTFMs — and (b) dumps every TrainingArguments field as an
-    MLflow param. This callback logs only metrics, keyed by epoch:
+    callback instead of HF's built-in integrations, which (a) log metrics at the global
+    optimizer step rather than the epoch index — making ``best_epoch`` mean different
+    things across NTFMs — and (b) dump every TrainingArguments field. This callback
+    appends one record per hook to the file named by the OSFING_EPOCH_LOG environment
+    variable (one YAML sequence item per line: ``- `` + JSON, flushed + fsynced so a
+    killed job keeps every finished epoch):
 
-        train.loss      (from the per-epoch training log; needs logging_strategy=epoch)
-        dev.accuracy    (eval_accuracy)
-        dev.f1_macro    (eval_f1_macro)
-        dev.f1_weighted (eval_weighted_f1)
-        dev.loss        (eval_loss)
+        on_log       -> {epoch, epoch_float, global_step, train.loss, learning_rate, grad_norm}
+                        (per-epoch training loss, key "loss"; needs logging_strategy=epoch.
+                        The final summary key "train_loss" is intentionally skipped.)
+        on_evaluate  -> {epoch, epoch_float, global_step, dev.accuracy, dev.f1_macro,
+                         dev.f1_weighted, dev.loss, dev.precision_weighted,
+                         dev.recall_weighted, dev.runtime_s, dev.samples_per_s}
+        on_train_end -> {kind: summary, epochs_completed, global_step, best_metric,
+                         best_model_checkpoint, gpu.peak_memory_mb, train_runtime_s}
 
-    matching ET-BERT's run_classifier.py (train.loss / dev.accuracy / dev.f1_macro,
-    step=epoch). Active only when the parent passes MLFLOW_RUN_ID / MLFLOW_TRACKING_URI
-    via the environment; otherwise every method is a no-op."""
+    ``epoch`` is the 1-based rounded epoch index (matching ET-BERT); the pipeline merges
+    the records of an epoch (utils/run_log.read_epoch_log). Rank-0 only. Without the
+    environment variable every method is a no-op."""
 
     _EVAL_NAME_MAP = {
         "eval_accuracy": "dev.accuracy",
         "eval_f1_macro": "dev.f1_macro",
         "eval_weighted_f1": "dev.f1_weighted",
         "eval_loss": "dev.loss",
+        "eval_weighted_prec": "dev.precision_weighted",
+        "eval_weighted_recall": "dev.recall_weighted",
+        "eval_runtime": "dev.runtime_s",
+        "eval_samples_per_second": "dev.samples_per_s",
     }
 
     def __init__(self):
-        self._run_id = os.environ.get("MLFLOW_RUN_ID")
-        self._client = None
-        if self._run_id:
-            try:
-                import mlflow
-                uri = os.environ.get("MLFLOW_TRACKING_URI")
-                if uri:
-                    mlflow.set_tracking_uri(uri)
-                self._client = mlflow.tracking.MlflowClient()
-            except Exception:
-                self._client = None
+        self._path = os.environ.get("OSFING_EPOCH_LOG")
+        self._t0 = None
 
     @staticmethod
     def _epoch(state):
@@ -80,32 +83,81 @@ class MLflowEpochParityCallback(TrainerCallback):
             return 0
 
     def _active(self, state):
-        return (
-            self._client is not None
-            and self._run_id
-            and getattr(state, "is_world_process_zero", True)
-        )
+        return bool(self._path) and getattr(state, "is_world_process_zero", True)
 
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        # Per-epoch training loss (key "loss"); the final summary uses "train_loss"
-        # and is intentionally skipped here.
-        if not self._active(state) or not logs or "loss" not in logs:
-            return
+    def _append(self, record):
         try:
-            self._client.log_metric(self._run_id, "train.loss", float(logs["loss"]), step=self._epoch(state))
+            clean = {
+                k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+                for k, v in record.items()
+            }
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write("- " + json.dumps(clean) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
         except Exception:
             pass
+
+    def _base(self, state):
+        try:
+            epoch_float = float(state.epoch) if state.epoch is not None else None
+        except Exception:
+            epoch_float = None
+        return {
+            "epoch": self._epoch(state),
+            "epoch_float": epoch_float,
+            "global_step": int(getattr(state, "global_step", 0) or 0),
+        }
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._t0 = time.time()
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not self._active(state) or not logs or "loss" not in logs:
+            return
+        rec = self._base(state)
+        rec["train.loss"] = float(logs["loss"])
+        for key in ("learning_rate", "grad_norm"):
+            if key in logs:
+                try:
+                    rec[key] = float(logs[key])
+                except (TypeError, ValueError):
+                    pass
+        rec["time"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        self._append(rec)
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         if not self._active(state) or not metrics:
             return
-        ep = self._epoch(state)
+        rec = self._base(state)
         for src, dst in self._EVAL_NAME_MAP.items():
             if src in metrics:
                 try:
-                    self._client.log_metric(self._run_id, dst, float(metrics[src]), step=ep)
-                except Exception:
+                    rec[dst] = float(metrics[src])
+                except (TypeError, ValueError):
                     pass
+        rec["time"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        self._append(rec)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if not self._active(state):
+            return
+        rec = {
+            "kind": "summary",
+            "epochs_completed": self._epoch(state),
+            "global_step": int(getattr(state, "global_step", 0) or 0),
+            "best_metric": (
+                float(state.best_metric) if getattr(state, "best_metric", None) is not None else None
+            ),
+            "best_model_checkpoint": getattr(state, "best_model_checkpoint", None),
+            "train_runtime_s": round(time.time() - self._t0, 3) if self._t0 else None,
+        }
+        try:
+            if torch.cuda.is_available():
+                rec["gpu.peak_memory_mb"] = float(torch.cuda.max_memory_allocated() / 1024 / 1024)
+        except Exception:
+            pass
+        self._append(rec)
 
 
 @dataclass
@@ -656,9 +708,10 @@ def main():
     trainer.add_callback(utils.StepSyncCallback())
     trainer.add_callback(utils.LearningRateLogCallback(utils.TB_WRITER))
     trainer.add_callback(utils.ThroughputTimingCallback(utils.TB_WRITER))
-    # MLflow per-epoch logging with ET-BERT-matching names/steps (the pipeline runs
-    # with --report_to none and relies on this instead of HF's MLflowCallback).
-    trainer.add_callback(MLflowEpochParityCallback())
+    # Per-epoch metrics for the NTFM-OSfing run log, with ET-BERT-matching names/steps
+    # (the pipeline runs with --report_to none and relies on this instead of HF's
+    # reporting integrations). Inert unless OSFING_EPOCH_LOG is set.
+    trainer.add_callback(EpochLogCallback())
     utils.start_gpu_logging(training_args.output_dir)
     utils.start_cpu_logging(training_args.output_dir)
     utils.start_ram_logging(training_args.output_dir)
@@ -701,27 +754,89 @@ def main():
     if training_args.do_predict and data_args.prediction_path and data_args.problem_type != "regression":
         # Inference path for the NTFM-OSfing pipeline. Runs the SAME trainer / model /
         # tokenizer / LabelEncoder used by --do_eval (which is the machinery that yields
-        # the correct accuracy), then writes predictions.tsv with two aligned columns
-        # ('label'=predicted, 'true'=ground truth) in the pipeline's label2id space.
+        # the correct accuracy), then writes the per-sample record the pipeline expects:
+        #   predictions.tsv   label (predicted id) / true (ground-truth id) / p_pred
+        #                     (softmax probability of the predicted class) / capture_key
+        #                     (source capture of the flow), all in the pipeline's label2id space
+        #   probabilities.csv full softmax matrix, one row per sample in the same order,
+        #                     columns = pipeline label ids in ascending order
         # Replaces the divergent standalone osfing/predict.py.
+        import csv as _csv
         import json as _json
         import numpy as _np
         logger.warning("*** Predict → %s ***", data_args.prediction_path)
         pred_out = trainer.predict(test_dataset)
         preds_arr = pred_out.predictions[0] if isinstance(pred_out.predictions, tuple) else pred_out.predictions
-        pred_le = _np.asarray(preds_arr).argmax(axis=-1).astype(int)
+        logits = _np.asarray(preds_arr, dtype=_np.float64)
+        _shifted = logits - logits.max(axis=-1, keepdims=True)
+        probs = _np.exp(_shifted)
+        probs /= probs.sum(axis=-1, keepdims=True)
+        pred_le = logits.argmax(axis=-1).astype(int)
         true_le = _np.asarray(pred_out.label_ids).astype(int)
         pred_str = label_encoder.inverse_transform(pred_le)
         true_str = label_encoder.inverse_transform(true_le)
         with open(data_args.label_maps, encoding="utf-8") as _fh:
-            _l2id = _json.load(_fh)["label2id"]
+            _label_maps_json = _json.load(_fh)
+        _l2id = _label_maps_json["label2id"]
+        _id2label = _label_maps_json.get("id2label", {})
+        # Capture identity per flow: the Arrow's ``source_file`` column (written by
+        # pre_process_src/Tokenize.py) survives the tokenizer map, and trainer.predict()
+        # keeps the dataset order, so it aligns with pred_le row by row.
+        _sources = None
+        try:
+            if "source_file" in test_dataset.column_names:
+                _sources = [str(s) for s in test_dataset["source_file"]]
+                if len(_sources) != len(pred_le):
+                    logger.warning(
+                        "source_file column has %d rows but %d predictions; dropping capture keys",
+                        len(_sources), len(pred_le),
+                    )
+                    _sources = None
+            else:
+                logger.warning("test Arrow has no source_file column (pre-schema cache?); capture_key left empty")
+        except Exception as _exc:
+            logger.warning("Could not read the source_file column: %s", _exc)
+            _sources = None
         out_path = data_args.prediction_path
-        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        out_dir = os.path.dirname(os.path.abspath(out_path))
+        os.makedirs(out_dir, exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as _out:
-            _out.write("label\ttrue\n")
-            for _p, _t in zip(pred_str, true_str):
-                _out.write(f"{_l2id[str(_p)]}\t{_l2id[str(_t)]}\n")
-        logger.warning("Wrote %d predictions (label<TAB>true) to %s", len(pred_le), out_path)
+            _out.write("label\ttrue\tp_pred\tcapture_key\n")
+            for _i, (_p, _t) in enumerate(zip(pred_str, true_str)):
+                _ck = _sources[_i] if _sources is not None else ""
+                _out.write(
+                    f"{_l2id[str(_p)]}\t{_l2id[str(_t)]}\t{probs[_i, pred_le[_i]]:.4f}\t{_ck}\n"
+                )
+        # probabilities.csv — reorder the LabelEncoder's (sorted-name) columns into pipeline
+        # label-id order so column j is label id j.
+        _prob_path = os.path.join(out_dir, "probabilities.csv")
+        try:
+            _col_ids = [int(_l2id[str(c)]) for c in label_encoder.classes_]
+            if len(_col_ids) != probs.shape[1]:
+                raise ValueError(
+                    f"LabelEncoder has {len(_col_ids)} classes but the model emits {probs.shape[1]} logits"
+                )
+            _order = _np.argsort(_col_ids)
+            _ids_sorted = [_col_ids[j] for j in _order]
+            _matrix = probs[:, _order]
+        except Exception as _exc:
+            logger.warning("probabilities.csv: falling back to raw logit column order (%s)", _exc)
+            _ids_sorted = list(range(probs.shape[1]))
+            _matrix = probs
+        with open(_prob_path, "w", encoding="utf-8", newline="") as _pf:
+            _pf.write(
+                "# columns = pipeline label ids; names: "
+                + ", ".join(f"{i}={_id2label.get(str(i), '?')}" for i in _ids_sorted)
+                + "\n"
+            )
+            _w = _csv.writer(_pf)
+            _w.writerow([str(i) for i in _ids_sorted])
+            for _row in _matrix:
+                _w.writerow([f"{v:.4f}" for v in _row])
+        logger.warning(
+            "Wrote %d predictions (label/true/p_pred/capture_key) to %s and the probability matrix to %s",
+            len(pred_le), out_path, _prob_path,
+        )
 
 
 if __name__ == "__main__":

@@ -398,6 +398,12 @@ def tokenizer_helper(
     counts_type = pa.list_(pa.uint32())
     protocol_type = pa.uint16()
     label_type = pa.string()
+    # NTFM-OSfing: capture identity of every flow — the name of the per-PCAP directory the
+    # C++ chain wrote the flow under (extracted/<label>/<pcap basename>/<flow file>), i.e.
+    # the source capture ("<os_folder>__<timestamp>" in the osfing pipeline). Lets the
+    # pipeline write a capture_key per test sample (per-VM / per-round analyses) without
+    # re-running inference. Downstream code ignores unknown columns.
+    source_file_type = pa.string()
 
     table_schema = pa.schema(
         [
@@ -409,11 +415,13 @@ def tokenizer_helper(
             pa.field("counts", counts_type),
             pa.field("protocol", protocol_type),
             pa.field("labels", label_type),
+            pa.field("source_file", source_file_type),
         ]
     )
 
-    # flow_durations, burst_tokens, directions, bytes_ar, iats, counts, protocols, labels
-    data = [[] for _ in range(8)]
+    # flow_durations, burst_tokens, directions, bytes_ar, iats, counts, protocols, labels, source_file
+    n_columns = 9
+    data = [[] for _ in range(n_columns)]
 
     with pa.OSFile(output_filename, "wb") as sink:
         with pa.ipc.new_stream(sink, schema=table_schema) as writer:
@@ -423,7 +431,8 @@ def tokenizer_helper(
 
                 if result is not None:
                     result[1] = slice_bytes_to_16bit_tokens(result[1])
-                    for j in range(8):
+                    result.append(os.path.basename(os.path.dirname(os.path.abspath(inpt_file))))
+                    for j in range(n_columns):
                         data[j].append(result[j])
 
                 if i % batch_size == 0 or i == total_files:
@@ -439,11 +448,12 @@ def tokenizer_helper(
                                 pa.array(data[5], type=counts_type),
                                 pa.array(data[6], type=protocol_type),
                                 pa.array(data[7], type=label_type),
+                                pa.array(data[8], type=source_file_type),
                             ],
                             schema=table_schema,
                         )
                         writer.write_batch(batch)
-                        data = [[] for _ in range(8)]
+                        data = [[] for _ in range(n_columns)]
 
 
 def get_args() -> Namespace:
