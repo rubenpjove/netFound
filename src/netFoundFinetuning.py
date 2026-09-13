@@ -74,6 +74,12 @@ class EpochLogCallback(TrainerCallback):
     def __init__(self):
         self._path = os.environ.get("OSFING_EPOCH_LOG")
         self._t0 = None
+        # Set by on_train_end: the --do_eval / --do_predict passes that follow trainer.train()
+        # also fire on_evaluate, with state.epoch == last epoch and the *best* model already
+        # loaded (load_best_model_at_end). Recording them would overwrite the last epoch's
+        # real dev metrics with a copy of best_epoch's (seen 2026-09-12, netFound major seed
+        # 2028: epoch 10 == epoch 4 byte for byte). Only in-training evaluations are epochs.
+        self._train_ended = False
 
     @staticmethod
     def _epoch(state):
@@ -127,7 +133,7 @@ class EpochLogCallback(TrainerCallback):
         self._append(rec)
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if not self._active(state) or not metrics:
+        if not self._active(state) or not metrics or self._train_ended:
             return
         rec = self._base(state)
         for src, dst in self._EVAL_NAME_MAP.items():
@@ -140,6 +146,7 @@ class EpochLogCallback(TrainerCallback):
         self._append(rec)
 
     def on_train_end(self, args, state, control, **kwargs):
+        self._train_ended = True
         if not self._active(state):
             return
         rec = {

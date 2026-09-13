@@ -117,6 +117,13 @@ def _install_binaries(binaries_dir: str, root: Path) -> None:
 
     Used when running from a fresh code snapshot (e.g. labrunner on CESGA)
     where the binaries are stored in a persistent directory outside the snapshot.
+
+    The snapshot is shared by every task of a SLURM job array, so another task may
+    already be *executing* these binaries: opening them for writing then fails with
+    ``ETXTBSY`` (measured 2026-09-12, 3/5 tasks of a netFound sweep). Hence the
+    install is idempotent (skip when the destination is already the same file) and
+    atomic (write a private temp file, then ``os.replace`` — renaming over a running
+    executable is allowed, the old inode simply lives on).
     """
     src_dir = Path(binaries_dir)
     dst_dir = root / "pre_process_src"
@@ -129,17 +136,55 @@ def _install_binaries(binaries_dir: str, root: Path) -> None:
                 f"Binary '{binary_name}' not found in binaries_dir={binaries_dir}. "
                 "Compile it first — see CLAUDE.md 'netFound one-time setup'."
             )
-        shutil.copy2(str(src), str(dst))
-        dst.chmod(0o755)
+        if _same_file_contents(src, dst):
+            continue
+        _atomic_copy(src, dst, mode=0o755)
     # Also restore execute permission on the .sh wrapper scripts (stripped by tar extraction)
     # and fix CRLF line endings (git on Windows converts LF→CRLF, breaking the shebang).
     for sh_file in dst_dir.glob("*.sh"):
         sh_file.chmod(0o755)
         content = sh_file.read_bytes()
         if b"\r\n" in content:
-            sh_file.write_bytes(content.replace(b"\r\n", b"\n"))
+            _atomic_write_bytes(sh_file, content.replace(b"\r\n", b"\n"), mode=0o755)
             logger.info("Fixed CRLF line endings in %s", sh_file.name)
     logger.info("Installed binaries from %s into %s", binaries_dir, dst_dir)
+
+
+def _same_file_contents(src: Path, dst: Path) -> bool:
+    """True when *dst* exists and holds the same bytes as *src* (size check first)."""
+    if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+        return False
+    with src.open("rb") as fa, dst.open("rb") as fb:
+        while True:
+            a, b = fa.read(1 << 20), fb.read(1 << 20)
+            if a != b:
+                return False
+            if not a:
+                return True
+
+
+def _atomic_write_bytes(dst: Path, data: bytes, mode: int) -> None:
+    """Write *data* to a private temp file next to *dst* and rename it into place."""
+    tmp = dst.with_name(f".{dst.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        tmp.chmod(mode)
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _atomic_copy(src: Path, dst: Path, mode: int) -> None:
+    """Copy *src* over *dst* atomically (safe while another process executes *dst*)."""
+    tmp = dst.with_name(f".{dst.name}.{os.getpid()}.tmp")
+    try:
+        shutil.copy2(str(src), str(tmp))
+        tmp.chmod(mode)
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def _validate_binaries(root: Path) -> None:
