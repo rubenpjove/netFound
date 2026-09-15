@@ -117,6 +117,7 @@ class netFoundRoformerEmbeddings(RoFormerEmbeddings, netFoundEmbeddingsWithMeta)
             bytes=None,
             pkt_count=None,
             protocol=None,
+            batch_max_burst_length=None,  # accepted for call-site parity; rotary positions live in the attention
     ):
         embeddings = self.word_embeddings(input_ids)
         embeddings = self.addMetaEmbeddings(embeddings, direction, iats, bytes, pkt_count, protocol)
