@@ -8,6 +8,7 @@ import json
 import math
 import random
 import os
+import re
 import time
 from copy import deepcopy
 import torch
@@ -290,15 +291,57 @@ def load_finetuning_model(config, model_path, logger):
         elif k in own:
             skipped_shape.append((k, list(v.shape), list(own[k].shape)))
     load_res = model.load_state_dict(filtered, strict=False)
+    unused = sorted(k for k in src if k not in own)
     logger.warning(
         "load_finetuning_model(%s): loaded %d/%d tensors (skipped %d shape-mismatched, "
-        "%d missing, %d unexpected)",
+        "%d missing, %d unexpected, %d checkpoint tensors without a target)",
         model_path, len(filtered), len(src), len(skipped_shape),
-        len(load_res.missing_keys), len(load_res.unexpected_keys),
+        len(load_res.missing_keys), len(load_res.unexpected_keys), len(unused),
     )
     if skipped_shape:
         logger.warning("  shape-mismatched (kept at init): %s",
                        [s[0] for s in skipped_shape][:20])
+    if unused:
+        logger.warning("  checkpoint tensors without a target in this model (first 20): %s", unused[:20])
+
+    # The pretraining checkpoints tie every encoder layer's burst position_embeddings to one
+    # tensor, so safetensors stores a single copy; the fine-tuning model keeps one per layer
+    # (_tied_weights_keys = {} for the transformers 5.x saver). Seed the layers that did not
+    # load from the one that did — pretrained values everywhere, then free to drift.
+    missing = list(load_res.missing_keys)
+    pos_re = re.compile(r"^(.*\.encoder\.layer\.)(\d+)(\.position_embeddings\.weight)$")
+    loaded_pos = [k for k in filtered if pos_re.match(k)]
+    if loaded_pos:
+        src_tensor = filtered[loaded_pos[0]]
+        seeded = []
+        for k in list(missing):
+            m = pos_re.match(k)
+            if m and own[k].shape == src_tensor.shape:
+                with torch.no_grad():
+                    own[k].copy_(src_tensor)
+                seeded.append(k)
+                missing.remove(k)
+        if seeded:
+            logger.warning("  position_embeddings seeded from %s for %d layers", loaded_pos[0], len(seeded))
+
+    # Strict contract (NTFM-OSfing, 2026-09-15): only the classification head may be randomly
+    # initialised. Anything else missing or shape-mismatched means the checkpoint and the model
+    # code disagree on the architecture (e.g. the v1 netFound-640M-base checkpoint under the v2
+    # code left all 144 feed-forward tensors random and nobody noticed for four months).
+    head_prefixes = ("hiddenLayer", "hiddenLayer2", "classifier")
+    bad_missing = [k for k in missing if not k.startswith(head_prefixes)]
+    bad_shape = [s[0] for s in skipped_shape if not s[0].startswith(head_prefixes)]
+    if bad_missing or bad_shape:
+        msg = (
+            f"load_finetuning_model({model_path}): the checkpoint does not match the model "
+            f"architecture — {len(bad_missing)} non-head tensors missing (first: {bad_missing[:5]}), "
+            f"{len(bad_shape)} shape-mismatched (first: {bad_shape[:5]}), {len(unused)} checkpoint "
+            f"tensors unused. Set OSFING_ALLOW_PARTIAL_LOAD=1 to run anyway (NOT a pretrained model)."
+        )
+        if os.environ.get("OSFING_ALLOW_PARTIAL_LOAD") == "1":
+            logger.warning("PARTIAL LOAD ALLOWED BY ENV: %s", msg)
+        else:
+            raise RuntimeError(msg)
     return model
 
 
