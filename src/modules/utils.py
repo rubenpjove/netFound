@@ -94,6 +94,14 @@ class ModelArguments:
         default=None,
         metadata={"help": "Strip payload from data"},
     )
+    # NTFM-OSfing no-pretraining control: keep model_name_or_path (its config.json fixes the
+    # architecture: hidden size, layers, rotary, position budget, strip_payload) but do NOT
+    # load its weights — every tensor, encoders included, stays at _init_weights() random init.
+    no_pretrained_weights: bool = dataclasses.field(
+        default=None,
+        metadata={"help": "Read only config.json from model_name_or_path; randomly initialise "
+                          "all weights (same architecture, no pretraining)."},
+    )
 
 
 @dataclasses.dataclass

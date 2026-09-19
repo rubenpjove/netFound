@@ -23,7 +23,7 @@ from tqdm.auto import tqdm
 from torch.distributed.elastic.multiprocessing.errors import record
 from datasets import concatenate_datasets
 from datasets.distributed import split_dataset_by_node
-from transformers import HfArgumentParser, TrainingArguments, TrainerCallback
+from transformers import HfArgumentParser, TrainingArguments, TrainerCallback, set_seed
 
 from modules.metrics import classif_metrics, regression_metrics
 from modules import utils
@@ -717,6 +717,22 @@ def main():
     labels_dtype = torch.float32 if data_args.problem_type == "regression" else torch.long
     data_collator = DataCollatorForFlowClassification(training_tokenizer.pad_token_id, labels_dtype)
     if model_args.model_name_or_path is not None and os.path.exists(
+            model_args.model_name_or_path
+    ) and getattr(model_args, "no_pretrained_weights", None):
+        # No-pretraining control (NTFM-OSfing): the architecture comes from the checkpoint's
+        # config.json (update_config above), the weights do not. Seed first so the random
+        # init is a function of --seed (the Trainer only seeds after the model is built).
+        set_seed(training_args.seed)
+        model = netFoundFinetuningModel(config=config)
+        n_params = sum(p.numel() for p in model.parameters())
+        logger.warning(
+            "NO PRETRAINED WEIGHTS (--no_pretrained_weights): architecture from %s/config.json, "
+            "all %d tensors (%d parameters) randomly initialised with _init_weights "
+            "(normal std=%s), seed %d; nothing read from the checkpoint's safetensors",
+            model_args.model_name_or_path, len(model.state_dict()), n_params,
+            getattr(config, "initializer_range", None), training_args.seed,
+        )
+    elif model_args.model_name_or_path is not None and os.path.exists(
             model_args.model_name_or_path
     ):
         logger.warning(f"Using weights from {model_args.model_name_or_path}")
