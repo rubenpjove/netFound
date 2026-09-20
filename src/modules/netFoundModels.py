@@ -1,5 +1,6 @@
 
 import torch
+import transformers
 import torch.nn as nn
 
 from transformers import PreTrainedModel
@@ -130,14 +131,30 @@ class netFoundBaseModel(netFoundPretrainedModel):
 class netFoundLanguageModelling(netFoundPretrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
+    # Tied weights, by design: the LM head decoder shares the word embeddings (+ its bias
+    # with lm_head.bias) and every encoder layer shares layer 0's burst position embeddings.
+    # transformers < 5 takes the legacy list-of-patterns; >= 5 wants an explicit
+    # {tied_param: source_param} dict, built per instance in __init__ (needs num_hidden_layers).
     _tied_weights_keys = [
         "base_transformer.encoder.layer.*.position_embeddings.weight",
         "lm_head.decoder.weight",
         "lm_head.decoder.bias",
     ]
 
+    @staticmethod
+    def _tied_weights_dict(config):
+        tied = {
+            "lm_head.decoder.weight": "base_transformer.embeddings.word_embeddings.weight",
+            "lm_head.decoder.bias": "lm_head.bias",
+        }
+        for i in range(1, config.num_hidden_layers):
+            tied[f"base_transformer.encoder.layer.{i}.position_embeddings.weight"] =                 "base_transformer.encoder.layer.0.position_embeddings.weight"
+        return tied
+
     def __init__(self, config):
         super().__init__(config)
+        if int(transformers.__version__.split(".")[0]) >= 5:
+            self._tied_weights_keys = self._tied_weights_dict(config)
 
         self.base_transformer = netFoundBaseModel(config)
         self.lm_head = LMHead(config)
